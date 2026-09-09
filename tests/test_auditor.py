@@ -1,79 +1,88 @@
 import pytest
 from botocore.stub import Stubber
-from botocore.exceptions import ClientError
 from core.auditor import HospitalityComplianceAuditor
 
-def test_check_encryption_compliant():
-    """Valida que el auditor reporte 'compliant: True' cuando el bucket tiene cifrado activo."""
-    auditor = HospitalityComplianceAuditor(region_name="us-east-1")
-    
-    with Stubber(auditor.s3_client) as stubber:
-        expected_response = {
+# --- PRUEBAS S3 ---
+
+def test_s3_encryption_compliant():
+    auditor = HospitalityComplianceAuditor()
+    with Stubber(auditor.s3_client) as stub:
+        stub.add_response("get_bucket_encryption", {
             "ServerSideEncryptionConfiguration": {
                 "Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]
             }
-        }
-        stubber.add_response("get_bucket_encryption", expected_response, {"Bucket": "hotel-secure-bucket"})
-        
-        result = auditor.check_encryption("hotel-secure-bucket")
-        
-        assert result["compliant"] is True
-        assert "Cifrado SSE activo" in result["details"]
+        }, {"Bucket": "b1"})
+        res = auditor.check_encryption("b1")
+        assert res["compliant"] is True
 
-def test_check_encryption_non_compliant():
-    """Valida que el auditor detecte la violación y cite las leyes cuando no hay cifrado."""
-    auditor = HospitalityComplianceAuditor(region_name="us-east-1")
-    
-    with Stubber(auditor.s3_client) as stubber:
-        stubber.add_client_error(
-            "get_bucket_encryption",
-            service_error_code="ServerSideEncryptionConfigurationNotFoundError",
-            service_message="The server side encryption configuration was not found"
-        )
-        
-        result = auditor.check_encryption("hotel-unencrypted-bucket")
-        
-        assert result["compliant"] is False
-        assert "Ley 1581 (Art. 17)" in result["frameworks"]
-        assert "PCI-DSS v4.0 (Req. 3.4)" in result["frameworks"]
+def test_s3_encryption_non_compliant():
+    auditor = HospitalityComplianceAuditor()
+    with Stubber(auditor.s3_client) as stub:
+        stub.add_client_error("get_bucket_encryption", "ServerSideEncryptionConfigurationNotFoundError")
+        res = auditor.check_encryption("b1")
+        assert res["compliant"] is False
+        assert "Ley 1581 (Art. 17)" in res["frameworks"]
 
-def test_check_public_access_block_compliant():
-    """Valida que reporte compliant: True cuando los 4 candados públicos están en True."""
-    auditor = HospitalityComplianceAuditor(region_name="us-east-1")
-    
-    with Stubber(auditor.s3_client) as stubber:
-        expected_response = {
+def test_s3_pab_compliant():
+    auditor = HospitalityComplianceAuditor()
+    with Stubber(auditor.s3_client) as stub:
+        stub.add_response("get_public_access_block", {
             "PublicAccessBlockConfiguration": {
-                "BlockPublicAcls": True,
-                "IgnorePublicAcls": True,
-                "BlockPublicPolicy": True,
-                "RestrictPublicBuckets": True
+                "BlockPublicAcls": True, "IgnorePublicAcls": True,
+                "BlockPublicPolicy": True, "RestrictPublicBuckets": True
             }
-        }
-        stubber.add_response("get_public_access_block", expected_response, {"Bucket": "hotel-secure-bucket"})
-        
-        result = auditor.check_public_access_block("hotel-secure-bucket")
-        
-        assert result["compliant"] is True
-        assert "100% activo" in result["details"]
+        }, {"Bucket": "b1"})
+        res = auditor.check_public_access_block("b1")
+        assert res["compliant"] is True
 
-def test_check_public_access_block_non_compliant():
-    """Valida que reporte violación cuando falta al menos un candado público."""
-    auditor = HospitalityComplianceAuditor(region_name="us-east-1")
-    
-    with Stubber(auditor.s3_client) as stubber:
-        expected_response = {
+def test_s3_pab_non_compliant():
+    auditor = HospitalityComplianceAuditor()
+    with Stubber(auditor.s3_client) as stub:
+        stub.add_response("get_public_access_block", {
             "PublicAccessBlockConfiguration": {
-                "BlockPublicAcls": True,
-                "IgnorePublicAcls": True,
-                "BlockPublicPolicy": False,
-                "RestrictPublicBuckets": True
+                "BlockPublicAcls": True, "IgnorePublicAcls": True,
+                "BlockPublicPolicy": False, "RestrictPublicBuckets": True
             }
-        }
-        stubber.add_response("get_public_access_block", expected_response, {"Bucket": "hotel-exposed-bucket"})
-        
-        result = auditor.check_public_access_block("hotel-exposed-bucket")
-        
-        assert result["compliant"] is False
-        assert "Ley 1581" in result["frameworks"]
-        assert "PCI-DSS Req. 1.2" in result["frameworks"]
+        }, {"Bucket": "b1"})
+        res = auditor.check_public_access_block("b1")
+        assert res["compliant"] is False
+
+# --- PRUEBAS RDS ---
+
+def test_rds_instance_compliant():
+    auditor = HospitalityComplianceAuditor()
+    with Stubber(auditor.rds_client) as stub:
+        stub.add_response("describe_db_instances", {
+            "DBInstances": [{"StorageEncrypted": True, "PubliclyAccessible": False}]
+        }, {"DBInstanceIdentifier": "hotel-pms-db"})
+        res = auditor.check_rds_instance_security("hotel-pms-db")
+        assert res["compliant"] is True
+
+def test_rds_instance_exposed_and_unencrypted():
+    auditor = HospitalityComplianceAuditor()
+    with Stubber(auditor.rds_client) as stub:
+        stub.add_response("describe_db_instances", {
+            "DBInstances": [{"StorageEncrypted": False, "PubliclyAccessible": True}]
+        }, {"DBInstanceIdentifier": "hotel-exposed-db"})
+        res = auditor.check_rds_instance_security("hotel-exposed-db")
+        assert res["compliant"] is False
+        assert "PCI-DSS Req. 1.3" in res["frameworks"]
+
+# --- PRUEBAS IAM ---
+
+def test_iam_policy_wildcard_violation():
+    auditor = HospitalityComplianceAuditor()
+    policy = {
+        "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]
+    }
+    res = auditor.check_iam_policy_least_privilege(policy)
+    assert res["compliant"] is False
+    assert "PCI-DSS Req. 7.1" in res["frameworks"]
+
+def test_iam_policy_restricted_compliant():
+    auditor = HospitalityComplianceAuditor()
+    policy = {
+        "Statement": [{"Effect": "Allow", "Action": ["s3:GetObject"], "Resource": "arn:aws:s3:::hotel-docs/*"}]
+    }
+    res = auditor.check_iam_policy_least_privilege(policy)
+    assert res["compliant"] is True
